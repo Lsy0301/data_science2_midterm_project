@@ -1,0 +1,414 @@
+---
+title: "DS2 Midterm Project"
+author: "Siying Li"
+date: "3/31/2020"
+output: pdf_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(knitr)
+library(ggplot2)
+library(dplyr)
+library(caret)
+library(gridExtra)
+library(tidyverse)
+library(glmnet)
+library(corrplot)
+library(splines)
+library(lasso2)
+library(Rmisc)
+library(FNN)
+library(pdp)
+library(earth)
+library(sandwich)
+library(stargazer)
+
+```
+
+## 1 Data Visualization
+```{r}
+house = read.csv(file = "train.csv", stringsAsFactors = FALSE)
+# Do not import strings as factors, since the ultimate goal is to transfer all variables to numeric. 
+
+dim(house)
+
+house = house %>% 
+  dplyr::select(-Id) %>% 
+  janitor::clean_names()
+```
+
+The house dataset consists of both integer and character variables. Most of the categorical variables are ordinal. There is a total of 81 variables, and the last column is our response. 
+
+#### 1.1 Data Cleaning
+```{r}
+# Get rid of virables with 500 plus missing values
+missing = 
+  colSums(sapply(house, is.na)) %>% 
+  as.data.frame() %>% 
+  mutate(variable = colnames(house)) %>% 
+  filter(. > 500) %>% 
+  pull(variable)
+
+house = 
+  house %>% 
+  select(-missing) %>% 
+  filter(lot_area < 100000) # filter out house with extreme lot size to prevent outliers. 
+
+```
+
+#### 1.2 Response Variable
+```{r}
+# Response variable distribution
+p1 = ggplot(data=house, aes(x=sale_price)) +
+        geom_histogram(fill="pink", binwidth = 10000) +
+        scale_x_continuous(breaks= seq(0, 800000, by=100000)) + ggtitle("Response Distribution")
+  
+# Right skewed
+
+# log transform on y
+p2 = ggplot(data=house, aes(x=log(sale_price))) +
+        geom_histogram(fill="pink", binwidth = 0.05) +
+        scale_x_continuous(breaks= seq(0, 800000, by=100000))+ ggtitle("log(Response) Distribution")
+
+grid.arrange(p1, p2, ncol = 2)
+
+```
+
+
+#### 1.3 Numeric Predictors
+```{r}
+label_num <- sapply(house, is.numeric) #set numeric variables as TRUE
+num_var <- house[, label_num] # get all the numeric variables 
+```
+
+There is a total of `r length(num_var)` numeric variables. 
+
+```{r}
+# Test Correlation
+corr_num <- cor(num_var, use = "pairwise.complete.obs") #correlations of all numeric variables
+
+#sort on decreasing correlations with sale price
+corr_sort <- as.matrix(sort(corr_num[,'sale_price'], decreasing = TRUE))
+#eliminate low correlation variables 
+high_corr <- names(which(apply(corr_sort, 1, function(x) abs(x)>0.3)))
+corr_num <- corr_num[high_corr, high_corr]
+
+corrplot.mixed(corr_num, tl.col="black", tl.pos = "lt")
+
+# 'Lot_frontage' variable represent linear feet of street connected to property. It contains NAs, which represents there is no backyard. Replace NA with zero. 
+house$lot_frontage[is.na(house$lot_frontage)] = 0
+
+# There is a "1st floor sq footage" variable and a "2nd floor square footage" variable.
+# It would be better to sum them up to total square footage for better pridiction. 
+house = 
+  house %>% 
+  mutate(total_sq = x1st_flr_sf + x2nd_flr_sf) %>% 
+  select(-x1st_flr_sf, -x2nd_flr_sf)
+
+# Convert year and month sold to factor variable
+house$mo_sold = as.factor(house$mo_sold)
+house$yr_sold = as.factor(house$yr_sold)
+
+```
+
+
+#### 1.4 Categorical Predictors
+```{r}
+char_num <- names(house[,sapply(house, is.character)])
+length(char_num)
+
+
+# Oridinal Predictors 
+house[house == "Ex"] = 5
+house[house == "Gd"] = 4
+house[house == "TA"] = 3
+house[house == "Fa"] = 2
+house[house == "Po"] = 1
+house[house == "NA"] = 3
+
+house$exter_qual = as.numeric(house$exter_qual)
+house$exter_qual = as.numeric(house$exter_qual)
+house$bsmt_qual = as.numeric(house$bsmt_qual)
+house$bsmt_cond = as.numeric(house$bsmt_cond)
+house$heating_qc= as.numeric(house$heating_qc)
+house$kitchen_qual= as.numeric(house$kitchen_qual)
+house$garage_qual= as.numeric(house$garage_qual)
+house$garage_cond= as.numeric(house$garage_cond)
+
+
+# LotShape: General shape of property
+house$lot_shape[house$lot_shape == "Reg"] = 4 # Regular
+house$lot_shape[house$lot_shape == "IR1"] = 3 # Slightly irregular
+house$lot_shape[house$lot_shape == "IR2"] = 2 # Moderately Irregular
+house$lot_shape[house$lot_shape == "IR3"] = 1 # Irregular
+house$lot_shape = as.numeric(house$lot_shape)
+
+# Utilities: Type of utilities available
+house$utilities[house$utilities == "AllPub"] = 4 # All public Utilities (E,G,W,& S)
+house$utilities[house$utilities == "NoSewr"] = 3 # Electricity, Gas, and Water (Septic Tank)
+house$utilities[house$utilities == "NoSeWa"] = 2 # Electricity and Gas Only
+house$utilities[house$utilities == "ELO"] = 1    # Electricity only
+house$utilities = as.numeric(house$utilities)
+
+# LandSlope: Slope of property
+house$land_slope[house$land_slope == "Gtl"] = 3 # Gentle slope
+house$land_slope[house$land_slope == "Mod"] = 2 # Moderate Slope
+house$land_slope[house$land_slope == "Sev"] = 1 # Severe Slope
+house$land_slope = as.numeric(house$land_slope)
+
+# BsmtExposure: Refers to walkout or garden level walls
+house$bsmt_exposure[house$bsmt_exposure == "Av"] = 3 # Average Exposure (split levels or foyers typically score average or above)  
+house$bsmt_exposure[house$bsmt_exposure == "Mn"
+                    ] = 2 # Mimimum Exposure
+house$bsmt_exposure[house$bsmt_exposure == "No"] = 1 # No Exposure
+house$bsmt_exposure[house$bsmt_exposure == 0] = 0 # No Exposure
+house$bsmt_exposure = as.numeric(house$bsmt_exposure)
+
+# BsmtFinType1: Rating of basement finished area
+house$bsmt_fin_type1[house$bsmt_fin_type1 == "GLQ"] = 6 # Good Living Quarters
+house$bsmt_fin_type1[house$bsmt_fin_type1 == "ALQ"] = 5 # Average Living Quarters
+house$bsmt_fin_type1[house$bsmt_fin_type1 == "BLQ"] = 4 # Below Average Living Quarters
+house$bsmt_fin_type1[house$bsmt_fin_type1 == "Rec"] = 3 # Average Rec Room
+house$bsmt_fin_type1[house$bsmt_fin_type1 == "LwQ"] = 2 # Low Quality
+house$bsmt_fin_type1[house$bsmt_fin_type1 == "Unf"] = 1 # Unfinshed
+house$bsmt_fin_type1[house$bsmt_fin_type1 == "NA"] = 3 # No Basement
+house$bsmt_fin_type1 = as.numeric(house$bsmt_fin_type1)
+
+# CentralAir: Central air conditioning
+house$central_air[house$central_air == "N"] = 0 # No
+house$central_air[house$central_air == "Y"] = 1 # Yes
+house$central_air = as.numeric(house$central_air)
+
+# Functional: Home functionality (Assume typical unless deductions are warranted)
+house$functional[house$functional == "Typ"] = 8 # Typical Functionality
+house$functional[house$functional == "Min1"] = 7 # Minor Deductions 1
+house$functional[house$functional == "Min2"] = 6 # Minor Deductions 2
+house$functional[house$functional == "Mod"] = 5 # Moderate Deductions
+house$functional[house$functional == "Maj1"] = 4 # Major Deductions 1
+house$functional[house$functional == "Maj2"] = 3 # Major Deductions 2
+house$functional[house$functional == "Sev"] = 2 # Severely Damaged
+house$functional[house$functional == "Sal"] = 1 # Salvage only
+house$functional = as.numeric(house$functional)
+
+# GarageFinish: Interior finish of the garage
+house$garage_finish[house$garage_finish == "Fin"] = 3 # Finished
+house$garage_finish[house$garage_finish == "RFn"] = 2 # Rough Finished
+house$garage_finish[house$garage_finish == "Unf"] = 1 # Unfinished
+house$garage_finish[house$garage_finish == 3 ] = 0 # No Garage
+house$garage_finish = as.numeric(house$garage_finish)
+
+# PavedDrive: Paved driveway
+house$paved_drive[house$paved_drive == "Y"] = 3 # Paved 
+house$paved_drive[house$paved_drive == "P"] = 2 # Partial Pavement
+house$paved_drive[house$paved_drive == "N"] = 1 # Dirt/Gravel
+house$paved_drive = as.numeric(house$paved_drive)
+
+# sapply(house, class)
+
+# Select rest of the character variables and change them to factors. 
+house[sapply(house, is.character)] <- lapply(house[sapply(house, is.character)], 
+                                       as.factor)
+# Select rest of the integer variables and change them to numeric. 
+# house[sapply(house, is.integer)] <- lapply(house[sapply(house, is.integer)], 
+#                                        as.numeric)
+```
+
+
+#### 1.5 Remove near zero variance pridictors and rows contaning NA
+```{r}
+# There are many variables that contains many zeros. Use a 95% cutoff for the percentage of distinct values out of the number of total samples. 
+near_zero = 
+  house %>% 
+  nearZeroVar(names = TRUE, freqCut = 75/25)
+
+house = 
+  house %>% 
+  select(-near_zero) %>% 
+  drop_na()
+
+```
+
+Finally, numer of numeric variable is `r length(house[,sapply(house, is.numeric)])`. And the numer of factor variable is `r length(house[,sapply(house, is.factor)])`.
+
+## 2 Model Fitting
+```{r}
+x = model.matrix(sale_price~., house) [,-1]
+y = log(house$sale_price)
+
+# remove colinear
+linear_combo = findLinearCombos(x)
+x = x[, -linear_combo$remove]
+
+# remove near zero variance
+near_zero_x = x %>% nearZeroVar(names = TRUE, freqCut = 85/15)
+x = as.data.frame(x)
+x = x %>% select(-near_zero_x)
+x = data.matrix(x)
+
+ctrl1 = trainControl(method = "repeatedcv", repeats = 5)
+```
+
+```{r}
+theme1 <- trellis.par.get()
+theme1$plot.symbol$col <- rgb(.2, .4, .2, .5)
+theme1$plot.symbol$pch <- 16
+theme1$plot.line$col <- rgb(.8, .1, .1, 1)
+theme1$plot.line$lwd <- 2
+theme1$strip.background$col <- rgb(.0, .2, .6, .2)
+trellis.par.set(theme1)
+featurePlot(x, y, plot = "scatter", labels = c("","Y"),
+            type = c("p"), layout = c(7, 7))
+```
+
+
+### 2.1 Multiple Linear Regression
+```{r}
+set.seed(2)
+
+lm.fit = train(x, y, method = "lm", trControl = ctrl1, preProcess = c("center", "scale"))
+
+# MSE
+lm.fit$results$RMSE
+```
+
+### 2.2 Ridge Regression
+```{r}
+set.seed(2)
+
+ridge.fit <- train(x, y,
+                   method = "glmnet",
+                   tuneGrid = expand.grid(alpha = 0, 
+                                          lambda = exp(seq(-4, -2, length=200))),
+                   preProc = c("center", "scale"),
+                   trControl = ctrl1)
+
+plot(ridge.fit, xTrans = function(x) log(x))
+
+# ridge.fit$results$RMSE
+
+ridge.fit$bestTune
+
+# coef(ridge.fit$finalModel,ridge.fit$bestTune$lambda)
+```
+
+### 2.3 Lasso
+```{r}
+set.seed(2)
+
+lasso.fit <- train(x, y,
+                   method = "glmnet",
+                   tuneGrid = expand.grid(alpha = 1, 
+                                          lambda = exp(seq(-9,-3, length=200))),
+                   preProc = c("center", "scale"),
+                   trControl = ctrl1)
+
+plot(lasso.fit, xTrans = function(x) log(x))
+
+lasso.fit$bestTune
+
+# number of non-zero coefficient
+coef = coef(lasso.fit$finalModel,lasso.fit$bestTune$lambda)
+nnzero(coef)
+
+# coef(lasso.fit$finalModel,lasso.fit$bestTune$lambda)
+```
+
+### 2.4 Elastic Net
+```{r}
+set.seed(2)
+
+enet.fit <- train(x, y,
+                  method = "glmnet",
+                  tuneGrid = expand.grid(alpha = seq(0, 1, length = 5), 
+                                         lambda = exp(seq(-9, -2, length = 50))),
+                  preProc = c("center", "scale"),
+                  trControl = ctrl1)
+enet.fit$bestTune
+
+ggplot(enet.fit, highlight = TRUE)
+```
+
+### 2.5 Principal Component Repression (PCR)
+```{r}
+set.seed(2)
+
+pcr.fit <- train(x, y,
+                 method = "pcr",
+                 tuneGrid  = data.frame(ncomp = 1:ncol(x)),
+                 trControl = ctrl1,
+                 preProc = c("center", "scale"))
+
+ggplot(pcr.fit, highlight = TRUE) + theme_bw()
+```
+
+### 2.6 Partial Least Squares
+```{r}
+set.seed(2)
+pls.fit <- train(x, y,
+                 method = "pls",
+                 tuneGrid = data.frame(ncomp = 1:ncol(x)),
+                 trControl = ctrl1,
+                 preProc = c("center", "scale"))
+
+ggplot(pls.fit, highlight = TRUE)
+```
+
+### 2.7 GAM
+```{r}
+set.seed(2)
+gam.fit <- train(x, y,
+                 method = "gam",
+                 tuneGrid = data.frame(method = "GCV.Cp", select = c(TRUE,FALSE)),
+                 trControl = ctrl1)
+gam.fit$finalModel
+
+```
+
+### 2.8 Multivariable Adaptive Regression Splines (MARS)
+```{r}
+set.seed(2)
+mars_grid <- expand.grid(degree = 1:2, 
+                         nprune = 2:ncol(x))
+
+set.seed(2)
+mars.fit <- train(x, y,
+                  method = "earth",
+                  tuneGrid = mars_grid,
+                  trControl = ctrl1)
+
+ggplot(mars.fit)
+
+mars.fit$bestTune
+
+coef(mars.fit$finalModel) 
+
+
+plot_mars = function(variable)
+  { p1 <- partial(mars.fit, pred.var = c(variable), grid.resolution = 10) %>% autoplot()
+  p1}
+
+name = c("overall_qual", "total_sq", "year_built", "fireplaces", "year_remod_add", "bsmt_fin_sf1", "open_porch_sf", "lot_area", "total_bsmt_sf")
+
+plot_list = map(name,plot_mars)
+
+multiplot(plotlist = plot_list, cols=3)
+```
+
+## 3 Between Model Comparison
+```{r}
+resamp <- resamples(list(Elastic = enet.fit, Lasso = lasso.fit, Ridge = ridge.fit, LM = lm.fit, PCR = pcr.fit, PLS = pls.fit, GAM = gam.fit, MARS = mars.fit))
+summary(resamp)
+
+parallelplot(resamp, metric = "RMSE")
+bwplot(resamp, metric = "RMSE")
+```
+
+## 4 Final Model Exploration
+```{r}
+varImp(mars.fit)
+```
+
+
